@@ -37,12 +37,15 @@ pub struct ByteStreamWriter {
     writer_id: WriterId,
     sender: Sender<Incoming>,
     metadata_client: SegmentMetadataClient,
+    offset: i64,
     runtime_handle: Handle,
     event_handle: Option<EventHandle>,
 }
 
 impl Write for ByteStreamWriter {
     fn write(&mut self, buf: &[u8]) -> Result<usize, Error> {
+        // TODO: Make this a conditional write using the current offset.
+        // This will guarantee that the offset is reliable or, if there are concurrent writers, an error will be returned.
         let oneshot_receiver = self.runtime_handle.block_on(async {
             let mut position = 0;
             let mut oneshot_receiver = loop {
@@ -69,6 +72,8 @@ impl Write for ByteStreamWriter {
         })?;
 
         self.event_handle = oneshot_receiver;
+        // TODO: Do we need to increment the offset if an error occurs?
+        self.offset += buf.len() as i64;
         Ok(buf.len())
     }
 
@@ -92,10 +97,13 @@ impl ByteStreamWriter {
                     .instrument(span),
             )
         });
+        // TODO: Need to get current tail offset.
+        let offset: i64 = 0;
         ByteStreamWriter {
             writer_id,
             sender,
             metadata_client,
+            offset,
             runtime_handle: handle,
             event_handle: None,
         }
@@ -152,6 +160,41 @@ impl ByteStreamWriter {
             Err(Error::new(ErrorKind::Other, format!("{:?}", e)))
         } else {
             Ok(())
+        }
+    }
+}
+
+/// The Seek implementation for ByteStreamWriter allows the user to obtain the current offset
+/// that would be used on the next write.
+/// Since Pravega streams are append-only, seeks to any offset other than the current offset are not allowed.
+/// If the stream has been truncated, the byte offset will be relative to the original beginning of the stream.
+/// The current implementation of `SeekFrom::End(0)` does not move the offset.
+/// TODO: `SeekFrom::End(0)` should obtain the tail offset from the Pravega server and seek to it.
+/// TODO: Allow seeking to any offset and rely on condition append to ensure that the write occurs at the specified offset.
+impl Seek for ByteStreamWriter {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        match pos {
+            SeekFrom::Start(offset) => {
+                if offset == self.offset as u64 {
+                    Ok(self.offset as u64)
+                } else {
+                    Err(Error::new(ErrorKind::InvalidInput, "Seek not allowed"))
+                }
+            },
+            SeekFrom::Current(offset) => {
+                if offset == 0 {
+                    Ok(self.offset as u64)
+                } else {
+                    Err(Error::new(ErrorKind::InvalidInput, "Seek not allowed"))
+                }
+            },
+            SeekFrom::End(offset) => {
+                if offset == 0 {
+                    Ok(self.offset as u64)
+                } else {
+                    Err(Error::new(ErrorKind::InvalidInput, "Seek not allowed"))
+                }
+            },
         }
     }
 }
