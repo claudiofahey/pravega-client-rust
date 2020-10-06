@@ -97,16 +97,17 @@ impl ByteStreamWriter {
                     .instrument(span),
             )
         });
-        // TODO: Need to get current tail offset.
-        let offset: i64 = 0;
-        ByteStreamWriter {
+        let mut writer = ByteStreamWriter {
             writer_id,
             sender,
             metadata_client,
-            offset,
+            offset: 0,
             runtime_handle: handle,
             event_handle: None,
-        }
+        };
+        // Set offset to the current tail of the segment.
+        writer.seek(SeekFrom::End(0)).unwrap();
+        writer
     }
 
     /// Seal will seal the segment and no further writes are allowed.
@@ -166,10 +167,9 @@ impl ByteStreamWriter {
 
 /// The Seek implementation for ByteStreamWriter allows the user to obtain the current offset
 /// that would be used on the next write.
-/// Since Pravega streams are append-only, seeks to any offset other than the current offset are not allowed.
+/// Since Pravega streams are append-only, writes to any offset other than the tail are not allowed.
 /// If the stream has been truncated, the byte offset will be relative to the original beginning of the stream.
-/// The current implementation of `SeekFrom::End(0)` does not move the offset.
-/// TODO: `SeekFrom::End(0)` should obtain the tail offset from the Pravega server and seek to it.
+/// `SeekFrom::End(0)` can be used to get the current tail offset from the Pravega server and seek to it.
 /// TODO: Allow seeking to any offset and rely on condition append to ensure that the write occurs at the specified offset.
 impl Seek for ByteStreamWriter {
     fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
@@ -190,6 +190,11 @@ impl Seek for ByteStreamWriter {
             },
             SeekFrom::End(offset) => {
                 if offset == 0 {
+                    let tail = self
+                        .runtime_handle
+                        .block_on(self.metadata_client.fetch_current_segment_length())
+                        .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?;
+                    self.offset = tail + offset;
                     Ok(self.offset as u64)
                 } else {
                     Err(Error::new(ErrorKind::InvalidInput, "Seek not allowed"))
