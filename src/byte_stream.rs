@@ -20,10 +20,12 @@ use pravega_rust_client_shared::{ScopedSegment, WriterId};
 use std::cmp;
 use std::io::Error;
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
+use std::time::Duration;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::{channel, Sender};
 use tokio::sync::oneshot;
 use tokio::sync::oneshot::error::TryRecvError;
+use tokio::time::timeout;
 use tracing::info_span;
 use tracing_futures::Instrument;
 use uuid::Uuid;
@@ -214,20 +216,27 @@ pub struct ByteStreamReader {
 
 impl Read for ByteStreamReader {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
+        let read_future = self.reader.read(self.offset, buf.len() as i32);
+        let timeout_fut = self
+            .runtime_handle
+            .enter(|| timeout(Duration::from_secs(2), read_future));
         let result = self
             .runtime_handle
-            .block_on(self.reader.read(self.offset, buf.len() as i32));
+            .block_on(timeout_fut);
         match result {
-            Ok(cmd) => {
-                if cmd.end_of_segment {
-                    Err(Error::new(ErrorKind::Other, "segment is sealed"))
-                } else {
-                    // Read may have returned more or less than the requested number of bytes.
-                    let size_to_return = cmp::min(buf.len(), cmd.data.len());
-                    self.offset += size_to_return as i64;
-                    buf[..size_to_return].copy_from_slice(&cmd.data[..size_to_return]);
-                    Ok(size_to_return)
+            Ok(result) => match result {
+                Ok(cmd) => {
+                    if cmd.end_of_segment {
+                        Err(Error::new(ErrorKind::Other, "segment is sealed"))
+                    } else {
+                        // Read may have returned more or less than the requested number of bytes.
+                        let size_to_return = cmp::min(buf.len(), cmd.data.len());
+                        self.offset += size_to_return as i64;
+                        buf[..size_to_return].copy_from_slice(&cmd.data[..size_to_return]);
+                        Ok(size_to_return)
+                    }
                 }
+                Err(e) => Err(Error::new(ErrorKind::Other, format!("Error: {:?}", e))),
             }
             Err(e) => Err(Error::new(ErrorKind::Other, format!("Error: {:?}", e))),
         }
