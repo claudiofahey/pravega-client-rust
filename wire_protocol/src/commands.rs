@@ -24,7 +24,7 @@ pub const WIRE_VERSION: i32 = 11;
 pub const OLDEST_COMPATIBLE_VERSION: i32 = 5;
 pub const TYPE_SIZE: u32 = 4;
 pub const TYPE_PLUS_LENGTH_SIZE: u32 = 8;
-pub const MAX_WIRECOMMAND_SIZE: u32 = 0x00FF_FFFF; // 16MB-1
+pub const MAX_WIRECOMMAND_SIZE: u32 = 1024*1024*1024;
 
 /**
  * trait for Command.

@@ -27,6 +27,7 @@ use pravega_wire_protocol::commands::{
 use pravega_wire_protocol::wire_commands::{Decode, Encode, Replies, Requests};
 use std::io::Cursor;
 use std::net::SocketAddr;
+use std::thread;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
@@ -66,6 +67,17 @@ impl MockServer {
         })
         .write_fields()
         .expect("Encoding event");
+        let segment_read_reply = Replies::SegmentRead(SegmentReadCommand {
+            segment: "segment".to_string(),
+            offset: 0,
+            at_tail: false,
+            end_of_segment: false,
+            data: event_data.clone(),
+            request_id: 0,
+        })
+        .write_fields()
+        .expect("error while encoding segment read ");
+
         let (mut stream, addr) = self.listener.accept().await.expect("get incoming stream");
         info!("run: accepted connection from addr {:?}", addr);
         loop {
@@ -84,7 +96,7 @@ impl MockServer {
                 .expect("read payload from incoming stream");
             let concatenated = [&header[..], &payload[..]].concat();
             let request: Requests = Requests::read_from(&concatenated).expect("decode wirecommand");
-            info!("run: request={:?}", request);
+            info!("run: thread={:?}, request={:?}", thread::current().id(), request);
             match request {
                 Requests::Hello(cmd) => {
                     let reply = Replies::Hello(cmd).write_fields().expect("encode reply");
@@ -135,19 +147,19 @@ impl MockServer {
                         .expect("write reply back to client");
                 }
                 Requests::ReadSegment(cmd) => {
-                    let reply = Replies::SegmentRead(SegmentReadCommand {
-                        segment: cmd.segment,
-                        offset: cmd.offset,
-                        at_tail: false,
-                        end_of_segment: false,
-                        data: event_data.clone(),
-                        request_id: cmd.request_id,
-                    })
-                    .write_fields()
-                    .expect("error while encoding segment read ");
-
+                    // let reply = Replies::SegmentRead(SegmentReadCommand {
+                    //     segment: cmd.segment,
+                    //     offset: cmd.offset,
+                    //     at_tail: false,
+                    //     end_of_segment: false,
+                    //     data: event_data.clone(),
+                    //     request_id: cmd.request_id,
+                    // })
+                    // .write_fields()
+                    // .expect("error while encoding segment read ");
+                    let reply = &segment_read_reply;
                     stream
-                        .write_all(&reply)
+                        .write_all(reply)
                         .await
                         .expect("Write segment read reply to client");
                 }
@@ -191,6 +203,38 @@ impl MockServer {
                     panic!("unsupported request {:?}", request);
                 }
             }
+        }
+    }
+
+    pub async fn run_raw(mut self) {
+        info!("MockServer::run_raw: listening on {:?}", self.address);
+        // data chunk used to respond to ReadSegment
+        let data_chunk = vec![0xAAu8; self.read_event_size];
+        let event_data: Vec<u8> = Requests::Event(EventCommand {
+            data: data_chunk,
+        })
+        .write_fields()
+        .expect("Encoding event");
+        let segment_read_reply = Replies::SegmentRead(SegmentReadCommand {
+            segment: "segment".to_string(),
+            offset: 0,
+            at_tail: false,
+            end_of_segment: false,
+            data: event_data.clone(),
+            request_id: 0,
+        })
+        .write_fields()
+        .expect("error while encoding segment read ");
+
+        let (mut stream, addr) = self.listener.accept().await.expect("get incoming stream");
+        info!("MockServer::run_raw: accepted connection from addr {:?}", addr);
+        loop {
+            info!("MockServer::run_raw: writing reply");
+            stream
+            .write_all(&segment_read_reply)
+            .await
+            .expect("Write segment read reply to client");
+            info!("MockServer::run_raw: done writing reply");
         }
     }
 }
@@ -246,13 +290,13 @@ fn read_mock_server(c: &mut Criterion) {
 }
 
 // Send a ReadSegment request on a TcpStream and receive a reply.
-async fn run_read_mock_client(stream: &mut TcpStream, last_offset: &mut i64) {
-    info!("run_read_mock_client: last_offset={}", last_offset);
+async fn run_read_mock_client(stream: &mut TcpStream, last_offset: &mut i64, read_event_size: usize) {
+    info!("run_read_mock_client: thread={:?}, last_offset={}", thread::current().id(), last_offset);
     // Send request.
     let request = Requests::ReadSegment(ReadSegmentCommand {
         segment: "segment0".to_string(),
         offset: *last_offset,
-        suggested_length: READ_EVENT_SIZE_BYTES as i32,
+        suggested_length: read_event_size as i32,
         delegation_token: "".to_string(),
         request_id: 0,
     })
@@ -287,7 +331,7 @@ async fn run_read_mock_client(stream: &mut TcpStream, last_offset: &mut i64) {
             panic!("unsupported reply {:?}", reply);
         }
     }
-    *last_offset += READ_EVENT_SIZE_BYTES as i64;
+    *last_offset += read_event_size as i64;
 }
 
 // Benchmark reads using a mock server and mock client.
@@ -296,7 +340,7 @@ fn benchmark_read_mock_server_mock_client(c: &mut Criterion) {
     let _ = tracing_subscriber::fmt::try_init();
     info!("benchmark_read_mock_server_mock_client: BEGIN");
     let mut group = c.benchmark_group("benchmark_read_mock_server_mock_client");
-    for size in [100*1024, 1*1024*1024].iter() {
+    for size in [100*1024*1024].iter() {
         group.throughput(Throughput::Bytes(*size as u64));
         group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, &size| {
             // Note that initializing the mock server will be included in the benchmark time.
@@ -304,12 +348,12 @@ fn benchmark_read_mock_server_mock_client(c: &mut Criterion) {
             let mut rt = tokio::runtime::Runtime::new().unwrap();
             let mock_server = rt.block_on(MockServer::with_size(size));
             let addr = mock_server.address.clone();
-            rt.spawn(async { MockServer::run(mock_server).await });
+            rt.spawn(async { MockServer::run_raw(mock_server).await });
             let mut stream = rt.block_on(TcpStream::connect(addr)).expect("connect");
             let mut last_offset: i64 = -1;
             info!("benchmark_read_mock_server_mock_client: connected to addr {:?}", addr);
             b.iter(|| {
-                rt.block_on(run_read_mock_client(&mut stream, &mut last_offset));
+                rt.block_on(run_read_mock_client(&mut stream, &mut last_offset, size));
             });
             info!("benchmark_read_mock_server_mock_client: bench_with_input: END");
         });
