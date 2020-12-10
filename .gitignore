@@ -21,6 +21,7 @@ pravega-*.tgz
 .gradle
 /integration_test/*.log
 /integration_test/log
+/integration_test/pravega-*
 *.log
 __pycache__/
 book/book
