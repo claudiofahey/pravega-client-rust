@@ -8,7 +8,7 @@
 // http://www.apache.org/licenses/LICENSE-2.0
 //
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId, Throughput};
 
 use byteorder::BigEndian;
 use pravega_client_rust::client_factory::ClientFactory;
@@ -27,6 +27,7 @@ use pravega_wire_protocol::commands::{
 use pravega_wire_protocol::wire_commands::{Decode, Encode, Replies, Requests};
 use std::io::Cursor;
 use std::net::SocketAddr;
+use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
@@ -39,19 +40,27 @@ const READ_EVENT_SIZE_BYTES: usize = 1 * 1024 * 1024; //100 KB event.
 struct MockServer {
     address: SocketAddr,
     listener: TcpListener,
+    read_event_size: usize,
 }
 
 impl MockServer {
     pub async fn new() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("local server");
         let address = listener.local_addr().unwrap();
-        MockServer { address, listener }
+        let read_event_size = READ_EVENT_SIZE_BYTES;
+        MockServer { address, listener, read_event_size }
+    }
+
+    pub async fn with_size(read_event_size: usize) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("local server");
+        let address = listener.local_addr().unwrap();
+        MockServer { address, listener, read_event_size }
     }
 
     pub async fn run(mut self) {
         info!("run: listening on {:?}", self.address);
-        // 100K data chunk
-        let data_chunk = vec![0xAAu8; READ_EVENT_SIZE_BYTES];
+        // data chunk used to respond to ReadSegment
+        let data_chunk = vec![0xAAu8; self.read_event_size];
         let event_data: Vec<u8> = Requests::Event(EventCommand {
             data: data_chunk,
         })
@@ -125,7 +134,6 @@ impl MockServer {
                         .await
                         .expect("write reply back to client");
                 }
-
                 Requests::ReadSegment(cmd) => {
                     let reply = Replies::SegmentRead(SegmentReadCommand {
                         segment: cmd.segment,
@@ -237,6 +245,7 @@ fn read_mock_server(c: &mut Criterion) {
     info!("last_offset={}", last_offset);
 }
 
+// Send a ReadSegment request on a TcpStream and receive a reply.
 async fn run_read_mock_client(stream: &mut TcpStream, last_offset: &mut i64) {
     info!("run_read_mock_client: last_offset={}", last_offset);
     // Send request.
@@ -282,23 +291,30 @@ async fn run_read_mock_client(stream: &mut TcpStream, last_offset: &mut i64) {
 }
 
 // Benchmark reads using a mock server and mock client.
+// This tests the TCP connection through the loopback adapter and serialization.
 fn benchmark_read_mock_server_mock_client(c: &mut Criterion) {
     let _ = tracing_subscriber::fmt::try_init();
     info!("benchmark_read_mock_server_mock_client: BEGIN");
-    let mut rt = tokio::runtime::Runtime::new().unwrap();
-    let mock_server = rt.block_on(MockServer::new());
-    let addr = mock_server.address.clone();
-    rt.spawn(async { MockServer::run(mock_server).await });
-    let mut stream = rt.block_on(TcpStream::connect(addr)).expect("connect");
-    info!("benchmark_read_mock_server_mock_client: connected to addr {:?}", addr);
-    let mut last_offset: i64 = -1;
-    c.bench_function("benchmark_read_mock_server_mock_client", |b| {
-        info!("benchmark_read_mock_server_mock_client: bench_function: BEGIN");
-        b.iter(|| {
-            rt.block_on(run_read_mock_client(&mut stream, &mut last_offset));
+    let mut group = c.benchmark_group("benchmark_read_mock_server_mock_client");
+    for size in [100*1024, 1*1024*1024].iter() {
+        group.throughput(Throughput::Bytes(*size as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, &size| {
+            // Note that initializing the mock server will be included in the benchmark time.
+            info!("benchmark_read_mock_server_mock_client: bench_with_input: BEGIN");
+            let mut rt = tokio::runtime::Runtime::new().unwrap();
+            let mock_server = rt.block_on(MockServer::with_size(size));
+            let addr = mock_server.address.clone();
+            rt.spawn(async { MockServer::run(mock_server).await });
+            let mut stream = rt.block_on(TcpStream::connect(addr)).expect("connect");
+            let mut last_offset: i64 = -1;
+            info!("benchmark_read_mock_server_mock_client: connected to addr {:?}", addr);
+            b.iter(|| {
+                rt.block_on(run_read_mock_client(&mut stream, &mut last_offset));
+            });
+            info!("benchmark_read_mock_server_mock_client: bench_with_input: END");
         });
-        info!("benchmark_read_mock_server_mock_client: bench_function: END");
-    });
+    }
+    group.finish();
     info!("benchmark_read_mock_server_mock_client: END");
 }
 
@@ -486,7 +502,9 @@ criterion_group! {
 }
 criterion_group! {
     name = reader_performance;
-    config = Criterion::default().sample_size(10);
+    config = Criterion::default()
+        .sample_size(10)
+        .measurement_time(Duration::from_secs(10));
     // targets = read_mock_server;
     targets = benchmark_read_mock_server_mock_client
 }
