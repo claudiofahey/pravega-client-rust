@@ -310,7 +310,7 @@ impl SegmentSlice {
                 // all the data of the event is already present.
                 let t = self.meta.segment_data.split_to(bytes_to_read);
                 event_data.value.put(t.value);
-                info!(
+                debug!(
                     "Event data is {:?} with length {}",
                     event_data,
                     event_data.value.len()
