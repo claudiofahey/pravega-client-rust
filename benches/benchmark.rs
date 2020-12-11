@@ -67,17 +67,6 @@ impl MockServer {
         })
         .write_fields()
         .expect("Encoding event");
-        let segment_read_reply = Replies::SegmentRead(SegmentReadCommand {
-            segment: "segment".to_string(),
-            offset: 0,
-            at_tail: false,
-            end_of_segment: false,
-            data: event_data.clone(),
-            request_id: 0,
-        })
-        .write_fields()
-        .expect("error while encoding segment read ");
-
         let (mut stream, addr) = self.listener.accept().await.expect("get incoming stream");
         info!("run: accepted connection from addr {:?}", addr);
         loop {
@@ -147,19 +136,18 @@ impl MockServer {
                         .expect("write reply back to client");
                 }
                 Requests::ReadSegment(cmd) => {
-                    // let reply = Replies::SegmentRead(SegmentReadCommand {
-                    //     segment: cmd.segment,
-                    //     offset: cmd.offset,
-                    //     at_tail: false,
-                    //     end_of_segment: false,
-                    //     data: event_data.clone(),
-                    //     request_id: cmd.request_id,
-                    // })
-                    // .write_fields()
-                    // .expect("error while encoding segment read ");
-                    let reply = &segment_read_reply;
+                    let reply = Replies::SegmentRead(SegmentReadCommand {
+                        segment: cmd.segment,
+                        offset: cmd.offset,
+                        at_tail: false,
+                        end_of_segment: false,
+                        data: event_data.clone(),
+                        request_id: cmd.request_id,
+                    })
+                    .write_fields()
+                    .expect("error while encoding segment read ");
                     stream
-                        .write_all(reply)
+                        .write_all(&reply)
                         .await
                         .expect("Write segment read reply to client");
                 }

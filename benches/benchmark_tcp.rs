@@ -8,35 +8,14 @@
 // http://www.apache.org/licenses/LICENSE-2.0
 //
 
-use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId, Throughput};
-
-use byteorder::BigEndian;
-use pravega_client_rust::client_factory::ClientFactory;
-use pravega_client_rust::error::SegmentWriterError;
-use pravega_client_rust::event_reader::EventReader;
-use pravega_client_rust::event_stream_writer::EventStreamWriter;
-use pravega_controller_client::ControllerClient;
-use pravega_rust_client_config::connection_type::{ConnectionType, MockType};
-use pravega_rust_client_config::{ClientConfig, ClientConfigBuilder};
-use pravega_rust_client_shared::*;
-use pravega_wire_protocol::{client_connection::{LENGTH_FIELD_LENGTH, LENGTH_FIELD_OFFSET}, commands::ReadSegmentCommand};
-use pravega_wire_protocol::commands::{
-    AppendSetupCommand, DataAppendedCommand, EventCommand, SegmentCreatedCommand, SegmentReadCommand,
-    TableEntries, TableEntriesDeltaReadCommand, TableEntriesUpdatedCommand, TYPE_PLUS_LENGTH_SIZE,
-};
-use pravega_wire_protocol::wire_commands::{Decode, Encode, Replies, Requests};
-use std::io::Cursor;
+use pravega_wire_protocol::commands::{EventCommand, SegmentReadCommand};
+use pravega_wire_protocol::wire_commands::{Encode, Replies, Requests};
 use std::net::SocketAddr;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tracing::info;
-
-static EVENT_NUM: usize = 10000;
-static EVENT_SIZE: usize = 100;
-const READ_EVENT_SIZE_BYTES: usize = 1 * 1024 * 1024; //100 KB event.
 
 struct MockServer {
     address: SocketAddr,
@@ -88,7 +67,6 @@ impl MockServer {
             .expect("Write segment read reply to client");
             info!("MockServer::run_raw: done writing reply");
         }
-        info!("MockServer::run_raw: END");
     }
 }
 
@@ -96,7 +74,7 @@ fn main() {
     let _ = tracing_subscriber::fmt::try_init();
     info!("benchmark_tcp.main: BEGIN");
     let mut rt = tokio::runtime::Runtime::new().unwrap();
-    let size: usize = 1000*1024*1024;
+    let size: usize = 8*1024*1024;
     let mock_server = rt.block_on(MockServer::with_size(size));
     let addr = mock_server.address.clone();
     rt.spawn(async { MockServer::run_raw(mock_server).await });
@@ -116,14 +94,17 @@ fn main() {
         });
         num_bytes += payload.len() as u64;
         info!("benchmark_tcp.main: received {} bytes", payload.len());
-        if !warm && t0.elapsed().as_secs_f64() > 2.0 {
-            t0 = Instant::now();
-            num_bytes = 0;
-            warm = true;
-            info!("benchmark_tcp.main: warmed up");
-        }
-        if t0.elapsed().as_secs_f64() > 4.0 {
-            break;
+        if warm {
+            if t0.elapsed().as_secs_f64() > 4.0 {
+                break;
+            }
+        } else {
+            if t0.elapsed().as_secs_f64() > 2.0 {
+                t0 = Instant::now();
+                num_bytes = 0;
+                warm = true;
+                info!("benchmark_tcp.main: warmed up");
+            }
         }
     }
     let dt = t0.elapsed().as_secs_f64();
