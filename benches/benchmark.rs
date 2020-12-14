@@ -36,7 +36,6 @@ use tracing::info;
 
 static EVENT_NUM: usize = 10000;
 static EVENT_SIZE: usize = 100;
-const READ_EVENT_SIZE_BYTES: usize = 1 * 1024 * 1024; //100 KB event.
 
 struct MockServer {
     address: SocketAddr,
@@ -48,7 +47,7 @@ impl MockServer {
     pub async fn new() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("local server");
         let address = listener.local_addr().unwrap();
-        let read_event_size = READ_EVENT_SIZE_BYTES;
+        let read_event_size = EVENT_SIZE;
         MockServer { address, listener, read_event_size }
     }
 
@@ -59,7 +58,7 @@ impl MockServer {
     }
 
     pub async fn run(mut self) {
-        info!("run: listening on {:?}", self.address);
+        info!("MockServer::run: listening on {:?}", self.address);
         // data chunk used to respond to ReadSegment
         let data_chunk = vec![0xAAu8; self.read_event_size];
         let event_data: Vec<u8> = Requests::Event(EventCommand {
@@ -68,13 +67,21 @@ impl MockServer {
         .write_fields()
         .expect("Encoding event");
         let (mut stream, addr) = self.listener.accept().await.expect("get incoming stream");
-        info!("run: accepted connection from addr {:?}", addr);
+        info!("MockServer::run: accepted connection from addr {:?}", addr);
         loop {
             let mut header: Vec<u8> = vec![0; LENGTH_FIELD_OFFSET as usize + LENGTH_FIELD_LENGTH as usize];
-            stream
+            let read_result = stream
                 .read_exact(&mut header[..])
-                .await
-                .expect("read header from incoming stream");
+                .await;
+            if let Err(error) = read_result {
+                match error.kind() {
+                    std::io::ErrorKind::UnexpectedEof => {
+                        info!("MockServer::run: terminating due to eof");
+                        return;
+                    },
+                    _ => panic!(error)
+                }
+            }
             let mut rdr = Cursor::new(&header[4..8]);
             let payload_length =
                 byteorder::ReadBytesExt::read_u32::<BigEndian>(&mut rdr).expect("exact size");
@@ -85,7 +92,7 @@ impl MockServer {
                 .expect("read payload from incoming stream");
             let concatenated = [&header[..], &payload[..]].concat();
             let request: Requests = Requests::read_from(&concatenated).expect("decode wirecommand");
-            info!("run: thread={:?}, request={:?}", thread::current().id(), request);
+            info!("MockServer::run: thread={:?}, request={:?}", thread::current().id(), request);
             match request {
                 Requests::Hello(cmd) => {
                     let reply = Replies::Hello(cmd).write_fields().expect("encode reply");
@@ -228,21 +235,23 @@ impl MockServer {
 }
 
 // Read a segment slice and consume events from the slice.
-async fn run_reader(reader: &mut EventReader, last_offset: &mut i64) {
+async fn run_reader(reader: &mut EventReader, last_offset: &mut i64, read_event_size: usize) {
+    info!("run_reader: last_offset={}", *last_offset);
     if let Some(mut slice) = reader.acquire_segment().await {
         while let Some(e) = slice.next() {
+            info!("run_reader: got next event");
             // validate offset in the segment.
             if *last_offset == -1i64 {
                 assert_eq!(0, e.offset_in_segment);
             } else {
                 assert_eq!(
-                    READ_EVENT_SIZE_BYTES + 2 * TYPE_PLUS_LENGTH_SIZE as usize,
+                    read_event_size + 2 * TYPE_PLUS_LENGTH_SIZE as usize,
                     (e.offset_in_segment - *last_offset) as usize
                 );
             }
             // validate the event read length
             assert_eq!(
-                READ_EVENT_SIZE_BYTES + TYPE_PLUS_LENGTH_SIZE as usize,
+                read_event_size + TYPE_PLUS_LENGTH_SIZE as usize,
                 e.value.len()
             );
             *last_offset = e.offset_in_segment;
@@ -252,29 +261,42 @@ async fn run_reader(reader: &mut EventReader, last_offset: &mut i64) {
     }
 }
 
-// This benchmark test uses a mock server that replies ok to any requests instantly. It involves
-// kernel latency.
+// Benchmark reads using a mock server and an EventReader.
+// The EventReader connects to the mock server using TCP through the loopback adapter.
 fn read_mock_server(c: &mut Criterion) {
     let _ = tracing_subscriber::fmt::try_init();
-    let mut rt = tokio::runtime::Runtime::new().unwrap();
-    let mock_server = rt.block_on(MockServer::new());
-    let config = ClientConfigBuilder::default()
-        .controller_uri(mock_server.address)
-        .mock(true)
-        .build()
-        .expect("creating config");
-    rt.spawn(async { MockServer::run(mock_server).await });
-    let mut reader = rt.block_on(setup_reader(config));
-    info!("start reader with mock server performance testing");
-    let mut last_offset: i64 = -1;
-    c.bench_function("read 100KB mock server", |b| {
-        b.iter(|| {
-            info!("read_mock_server: iter: last_offset={}", last_offset);
-            rt.block_on(run_reader(&mut reader, &mut last_offset));
+    info!("read_mock_server: BEGIN");
+    let mut group = c.benchmark_group("read_mock_server");
+    for size in [100*1024, 1*1024*1024, 8*1024*1024].iter() {
+        group.throughput(Throughput::Bytes(*size as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, &size| {
+            // Note that initializing the mock server will be included in the benchmark time.
+            info!("read_mock_server: bench_with_input: BEGIN");
+            let mut rt = tokio::runtime::Runtime::new().unwrap();
+            let mock_server = rt.block_on(MockServer::with_size(size));
+            let addr = mock_server.address.clone();
+            let config = ClientConfigBuilder::default()
+                .controller_uri(addr)
+                .mock(true)
+                .build()
+                .expect("creating config");
+            let join_handle = rt.spawn(async { MockServer::run(mock_server).await });
+            let mut reader = rt.block_on(setup_reader(config));
+            let mut last_offset: i64 = -1;
+            info!("read_mock_server: connected to addr {:?}", addr);
+            b.iter(|| {
+                rt.block_on(run_reader(&mut reader, &mut last_offset, size));
+            });
+            drop(reader);
+            info!("read_mock_server: waiting for mock server to terminate");
+            rt.block_on(join_handle).expect("join");
+            info!("read_mock_server: dropping runtime");
+            drop(rt);
+            info!("read_mock_server: bench_with_input: END");
         });
-    });
-    println!("reader performance testing finished");
-    info!("last_offset={}", last_offset);
+    }
+    group.finish();
+    info!("read_mock_server: END");
 }
 
 // Send a ReadSegment request on a TcpStream and receive a reply.
@@ -328,7 +350,7 @@ fn benchmark_read_mock_server_mock_client(c: &mut Criterion) {
     let _ = tracing_subscriber::fmt::try_init();
     info!("benchmark_read_mock_server_mock_client: BEGIN");
     let mut group = c.benchmark_group("benchmark_read_mock_server_mock_client");
-    for size in [100*1024*1024].iter() {
+    for size in [10*1024*1024].iter() {
         group.throughput(Throughput::Bytes(*size as u64));
         group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, &size| {
             // Note that initializing the mock server will be included in the benchmark time.
@@ -537,7 +559,7 @@ criterion_group! {
     config = Criterion::default()
         .sample_size(10)
         .measurement_time(Duration::from_secs(10));
-    // targets = read_mock_server;
-    targets = benchmark_read_mock_server_mock_client
+    targets = read_mock_server
+    // targets = benchmark_read_mock_server_mock_client
 }
 criterion_main!(reader_performance);
