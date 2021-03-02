@@ -468,10 +468,9 @@ impl PrefetchingAsyncSegmentReader {
         length: i32,
     ) {
         let result = reader.read(offset, length).await;
-        sender
+        let _ = sender
             .send(result)
-            .map_err(|e| warn!("failed to send reply back: {:?}", e))
-            .expect("send reply back");
+            .map_err(|_| warn!("failed to send reply back"));
     }
 
     fn fill_buffer_if_available(&mut self) -> Result<(), ReaderError> {
